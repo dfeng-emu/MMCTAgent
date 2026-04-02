@@ -197,3 +197,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .github/copilot-instructions.md
+
+# Claude Code
+.claude/
+
+# PyTorch model weights
+*.pt
