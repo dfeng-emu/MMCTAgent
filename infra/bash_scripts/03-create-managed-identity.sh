@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -e
+export MSYS_NO_PATHCONV=1
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$(realpath "$script_dir/../infra_config.yaml")"
 

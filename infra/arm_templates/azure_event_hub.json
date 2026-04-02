@@ -18,7 +18,7 @@
             "type": "Microsoft.EventHub/namespaces",
             "apiVersion": "2024-05-01-preview",
             "name": "[parameters('eventhubName')]",
-            "location": "Central India",
+            "location": "eastus",
             "sku": {
                 "name": "Standard",
                 "tier": "Standard",
@@ -29,7 +29,7 @@
                     "maxReplicationLagDurationInSeconds": 0,
                     "locations": [
                         {
-                            "locationName": "Central India",
+                            "locationName": "eastus",
                             "roleType": "Primary"
                         }
                     ]

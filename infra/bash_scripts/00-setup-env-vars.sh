@@ -30,21 +30,21 @@ convert_path_if_windows() {
 
 # --------------  SET VARIABLES --------------------
 
-resourceGroup="test-arm-rg"
+resourceGroup="msrxct-mmct-rg"
 base_dir="$script_dir/../arm_templates"
 
 # Templates and Resources
-storageAccountName="ossa"
+storageAccountName="msrxctmmctsa"
 storageAccountTemplateFile="$(convert_path_if_windows "$base_dir/storage_account.json")"
 
-aiSearchServiceName="osais"
+aiSearchServiceName="msrxct-mmct-search"
 aiSearchServiceTemplateFile="$(convert_path_if_windows "$base_dir/azure_ai_search.json")"
 
-azureSpeechServiceName="osstt"
-azureSpeechServiceRegion="centralindia"
+azureSpeechServiceName="msrxct-mmct-speech"
+azureSpeechServiceRegion="eastus"
 azureSpeechServiceTemplateFile="$(convert_path_if_windows "$base_dir/azure_speech_service.json")"
 
-containerRegistryName="osacr"
+containerRegistryName="msrxctmmctacr"
 containerRegistryTemplateFile="$(convert_path_if_windows "$base_dir/container_registry.json")"
 
 aspPremiumName="osaspp"
@@ -53,15 +53,15 @@ aspPremiumTemplateFile="$(convert_path_if_windows "$base_dir/app_service_plan_pr
 aspBasicName="osaspb"
 aspBasicTemplateFile="$(convert_path_if_windows "$base_dir/app_service_plan_basic.json")"
 
-eventhubName="oseventhub"
+eventhubName="msrxct-mmct-eventhub"
 queryPipelineTopicName="query-eventhub"
 ingestionPipelineTopicName="ingestion-eventhub"
 eventhubTemplateFile="$(convert_path_if_windows "$base_dir/azure_event_hub.json")"
 
-azureOpenAIName="osazoai"
+azureOpenAIName="msrxct-mmct-aoai"
 azureOpenAITemplateFile="$(convert_path_if_windows "$base_dir/azure_openai.json")"
 
-identityName="osmidentity"
+identityName="msrxct-mmct-identity"
 
 imageTag="1.0"
 baseImage="${containerRegistryName}.azurecr.io/osbase:${imageTag}"

@@ -12,7 +12,7 @@
             "type": "Microsoft.Search/searchServices",
             "apiVersion": "2025-02-01-preview",
             "name": "[parameters('aiSearchServiceName')]",
-            "location": "Central India",
+            "location": "eastus",
             "sku": {
                 "name": "standard"
             },

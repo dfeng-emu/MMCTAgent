@@ -12,7 +12,7 @@
             "type": "Microsoft.Storage/storageAccounts",
             "apiVersion": "2024-01-01",
             "name": "[parameters('storageAccountName')]",
-            "location": "Central India",
+            "location": "eastus",
             "sku": {
                 "name": "Standard_RAGRS",
                 "tier": "Standard"

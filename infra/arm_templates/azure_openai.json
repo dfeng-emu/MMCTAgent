@@ -18,7 +18,7 @@
       "type": "Microsoft.CognitiveServices/accounts",
       "apiVersion": "2025-04-01-preview",
       "name": "[parameters('azureOpenAIName')]",
-      "location": "southindia",
+      "location": "swedencentral",
       "sku": { "name": "S0" },
       "kind": "OpenAI",
       "identity": { "type": "SystemAssigned" },
