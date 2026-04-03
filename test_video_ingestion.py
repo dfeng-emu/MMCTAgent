@@ -63,11 +63,11 @@ provider = IngestionProviderConfig(
     ),
 )
 
-VIDEO_PATH = os.path.join(os.path.dirname(__file__), "test_data", "big_buck_bunny.mp4")
+VIDEO_PATH = os.path.join(os.path.dirname(__file__), "test_data", "sintel_trailer.mp4")
 
 pipeline = IngestionPipeline(
     video_path=VIDEO_PATH,
-    video_id="big-buck-bunny-test-001",
+    video_id="sintel-trailer-test-001",
     provider=provider,
     language=Languages.ENGLISH_UNITED_STATES,
     verbosity=1,
