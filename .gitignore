@@ -205,3 +205,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .github/copilot-instructions.md
+
+# Claude Code local config (CLAUDE.md, settings, etc.)
+.claude/
+
+# Personal scratch docs (planning notes, ad-hoc test scripts, MSAL caches)
+.mydocs/
