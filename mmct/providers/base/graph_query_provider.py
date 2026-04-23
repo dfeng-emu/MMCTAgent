@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from mmct.providers.base.database_context import get_database_override
+
 
 @dataclass
 class SearchResult:
@@ -37,8 +39,34 @@ class BaseGraphQueryProvider(ABC):
     """
 
     # =========================================================================
+    # Database resolution
+    # =========================================================================
+
+    def get_database(self, default: Optional[str] = None) -> Optional[str]:
+        """Return the active database name for the current request.
+
+        Checks the per-request ``database_override`` context variable first;
+        falls back to *default* (typically ``self._database`` in concrete
+        providers).
+        """
+        return get_database_override() or default
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
+
+    async def check_health(self) -> Dict[str, Any]:
+        """Verify that the graph database is reachable.
+
+        Returns:
+            Dict with at least ``{"status": "ok"}`` on success,
+            or ``{"status": "error", "error": "..."}`` on failure.
+        """
+        try:
+            ids = await self.get_all_video_ids()
+            return {"status": "ok", "video_count": len(ids)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     @abstractmethod
     async def close(self) -> None:

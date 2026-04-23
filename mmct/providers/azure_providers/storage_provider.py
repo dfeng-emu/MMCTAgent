@@ -214,6 +214,26 @@ class AzureStorageProvider(BaseStorageProvider):
             if client:
                 await client.close()
 
+    async def check_health(self) -> Dict[str, Any]:
+        """Verify Azure Blob Storage connectivity.
+
+        Lists the default container to confirm the service client can
+        authenticate and reach the storage account.
+        """
+        try:
+            container = self.service_client.get_container_client(
+                self.keyframe_container_name
+            )
+            exists = await container.exists()
+            await container.close()
+            return {
+                "status": "ok",
+                "container": self.keyframe_container_name,
+                "container_exists": exists,
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     async def close(self) -> None:
         """Closes the Azure Blob Storage service client."""
         if self.service_client:

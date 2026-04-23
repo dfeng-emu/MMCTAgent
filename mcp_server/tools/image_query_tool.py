@@ -8,11 +8,31 @@ supporting both local file paths and remote URLs.
 import os
 import aiohttp
 import tempfile
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict, Any
 from loguru import logger
 from mcp_server.server import mcp
 from mmct.image_pipeline import ImageAgent, ImageQnaTools
+from mmct.image_pipeline.config import ImageAgentProviderConfig
 from config.provider_config import get_image_agent_provider
+
+# Singleton provider config — reused across requests.
+_provider_config: Optional[ImageAgentProviderConfig] = None
+
+
+def get_image_provider() -> ImageAgentProviderConfig:
+    """Return a singleton ImageAgentProviderConfig."""
+    global _provider_config
+    if _provider_config is None:
+        _provider_config = get_image_agent_provider()
+    return _provider_config
+
+
+async def check_image_health() -> Dict[str, Any]:
+    """Check health of the image pipeline's LLM provider."""
+    provider = get_image_provider()
+    if provider.llm_provider is not None and hasattr(provider.llm_provider, "check_health"):
+        return {"llm": await provider.llm_provider.check_health()}
+    return {"llm": {"status": "not_configured"}}
 
 @mcp.tool(
     name="image_query",
@@ -68,15 +88,18 @@ async def image_query(
                     else:
                         raise Exception(f"Failed to download image source: HTTP {response.status}")
 
-        logger.info(f"Executing MMCT ImageAgent with tools: {tools if tools else 'all'}")
+        # Convert string tool names to ImageQnaTools enum members
+        tools_enum = [ImageQnaTools(t) for t in tools] if tools else None
+
+        logger.info(f"Executing MMCT ImageAgent with tools: {tools_enum if tools_enum else 'all'}")
 
         # Initialize and run ImageAgent
         image_agent = ImageAgent(
             image_path=save_path,
             query=query,
-            provider=get_image_agent_provider(),
+            provider=get_image_provider(),
             use_critic_agent=use_critic_agent,
-            tools=tools, # ImageAgent handles None by using all defaults
+            tools=tools_enum,
             stream=True,
             use_console=True,
             disable_console_log=False

@@ -69,7 +69,7 @@ async def main():
                 "image_query", 
                 {
                     "query": "What is in this image?",
-                    "image_path": "https://raw.githubusercontent.com/microsoft/autogen-agentchat/main/docs/src/logo.png",
+                    "image_path": "https://www.w3.org/Graphics/PNG/nurbcup2si.png",
                     "use_critic_agent": False,
                     "tools": ["vit", "ocr"]
                 }
@@ -82,7 +82,7 @@ async def main():
                 "video_query",
                 {
                     "query": "What are the main topics discussed?",
-                    "video_id": "ro7xnvFP9Sk",
+                    "video_id": "58550",
                     "mode": "graph_state"
                 }
             )
@@ -94,8 +94,21 @@ async def main():
                 "video_query",
                 {
                     "query": "Who is the presenter?",
-                    "video_id": "ro7xnvFP9Sk",
+                    "video_id": "58550",
                     "mode": "graph_agent"
+                }
+            )
+
+            # 4. Test video_query with database override
+            # Targets a specific Neo4j database instead of the server default.
+            await test_tool(
+                client,
+                "video_query",
+                {
+                    "query": "What are the main topics discussed?",
+                    "video_id": "58550",
+                    "mode": "graph_state",
+                    "database": "neo4j"
                 }
             )
             

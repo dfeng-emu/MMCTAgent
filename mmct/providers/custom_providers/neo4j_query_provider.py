@@ -95,6 +95,25 @@ class Neo4jQueryProvider(BaseGraphQueryProvider):
     # Lifecycle
     # =========================================================================
 
+    async def check_health(self) -> Dict[str, Any]:
+        """Verify Neo4j connectivity with an explicit driver ping.
+
+        Uses ``driver.verify_connectivity()`` which performs a real TCP
+        round-trip, unlike ``get_all_video_ids()`` which may silently
+        return empty results for unreachable hosts.
+        """
+        try:
+            await self._ensure_driver()
+            await self._driver.verify_connectivity()
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+        try:
+            ids = await self.get_all_video_ids()
+            return {"status": "ok", "video_count": len(ids)}
+        except Exception as e:
+            return {"status": "error", "error": f"connected but query failed: {e}"}
+
     async def _ensure_driver(self) -> None:
         """Lazy initialize Neo4j async driver (double-checked locking)."""
         if self._driver is not None:
@@ -144,9 +163,10 @@ class Neo4jQueryProvider(BaseGraphQueryProvider):
             List of record dictionaries.
         """
         await self._ensure_driver()
+        db = self.get_database(self._database)
         for attempt in range(2):
             try:
-                async with self._driver.session(database=self._database) as session:
+                async with self._driver.session(database=db) as session:
                     result = await session.run(query, parameters or {})
                     return [dict(record) async for record in result]
             except Exception as e:

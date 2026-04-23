@@ -1,0 +1,535 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub Actions — Build and Deploy MCP Server to Azure Container Apps
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Trigger: push to main when MCP-relevant files change, or manual dispatch.
+#
+# Jobs:
+#   1. detect-changes  — Check if base image deps changed (Dockerfile.base, pyproject.toml)
+#   2. build-base      — Conditional: rebuild & push base image to ACR only if deps changed
+#   3. build-deploy-mcp — Always: build MCP image from ACR base, push, deploy to Container App
+#
+# Required GitHub Secrets:
+#   AZURE_CLIENT_ID        — App registration client ID (from Azure Portal)
+#   AZURE_TENANT_ID        — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID  — Azure subscription ID
+#   ACR_NAME               — Azure Container Registry name (without .azurecr.io)
+#   AZURE_RESOURCE_GROUP   — Azure resource group
+#   AZURE_LOCATION         — Azure region (e.g. eastus)
+#   MCP_APP_NAME           — Container App name (default: mmctagent-mcp)
+#   CONTAINER_ENV_NAME     — Container Apps Environment name (default: mmct-env)
+#   MCP_ENV_VARS_PROD      — Newline-separated KEY=VALUE pairs for the container
+#                            (NEO4J_URI, LLM_ENDPOINT, etc.)
+#
+# Networking:
+#   This workflow provisions a VNet + NAT Gateway so the Container App
+#   Environment has a single, stable outbound IP. That IP must be manually
+#   added to the graph database's firewall/NSG allow-list for Bolt (7687)
+#   access. The NAT IP is printed in the workflow summary after each deploy.
+#
+#   ⚠  One-time migration: if the Container Apps Environment was originally
+#      created without a VNet, it must be deleted and recreated. The
+#      workflow_dispatch input "recreate_environment" handles this.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy MCP Server
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mcp_server/**'
+      - 'mmct/**'
+      - 'config/**'
+      - 'Dockerfile.base'
+      - 'infra/container_app/Dockerfile.mcp'
+      - 'pyproject.toml'
+  workflow_dispatch:
+    inputs:
+      recreate_environment:
+        description: >
+          One-time migration: delete and recreate the Container Apps
+          Environment with VNet + NAT Gateway networking. Required if the
+          env was originally created without a VNet. WARNING: this will
+          cause downtime for all apps in the environment.
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: deploy-mcp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  LOCATION: ${{ secrets.AZURE_LOCATION }}
+  MCP_APP_NAME: ${{ secrets.MCP_APP_NAME || (github.ref == 'refs/heads/main' && 'mmctagent-mcp-prod' || 'mmctagent-mcp') }}
+  CONTAINER_ENV_NAME: ${{ secrets.CONTAINER_ENV_NAME || (github.ref == 'refs/heads/main' && 'mmct-env-prod' || 'mmct-env') }}
+  USER_ASSIGNED_IDENTITY: ${{ secrets.USER_ASSIGNED_IDENTITY_ID }}
+  # Networking — VNet + NAT Gateway for stable outbound IP
+  VNET_NAME: ${{ github.ref == 'refs/heads/main' && 'mmct-vnet-prod' || 'mmct-vnet' }}
+  SUBNET_NAME: mmct-subnet-apps
+  NAT_GW_NAME: ${{ github.ref == 'refs/heads/main' && 'mmct-natgw-prod' || 'mmct-natgw' }}
+  NAT_GW_PIP_NAME: ${{ github.ref == 'refs/heads/main' && 'mmct-natgw-pip-prod' || 'mmct-natgw-pip' }}
+
+jobs:
+  # ── Job 1: Detect whether base image needs rebuilding ─────────────────────
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      base_changed: ${{ steps.filter.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            base:
+              - 'Dockerfile.base'
+              - 'pyproject.toml'
+
+  # ── Job 2: Build & push base image (only when deps change) ───────────────
+  build-base:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.base_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR Login
+        run: az acr login --name $ACR_NAME
+
+      - name: Build & push base image
+        run: |
+          docker build -f Dockerfile.base \
+            -t $ACR_NAME.azurecr.io/mmctagent-base:latest .
+          docker push $ACR_NAME.azurecr.io/mmctagent-base:latest
+
+  # ── Job 3: Build MCP image, push to ACR, deploy Container App ────────────
+  build-deploy-mcp:
+    needs: [detect-changes, build-base]
+    # Always run this job, even if build-base was skipped (base unchanged)
+    if: always() && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR Login
+        run: az acr login --name $ACR_NAME
+
+      - name: Set image tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Build MCP image
+        run: |
+          docker build -f infra/container_app/Dockerfile.mcp \
+            --build-arg BASE_IMAGE=$ACR_NAME.azurecr.io/mmctagent-base:latest \
+            -t $ACR_NAME.azurecr.io/mmctagent-mcp:$IMAGE_TAG \
+            -t $ACR_NAME.azurecr.io/mmctagent-mcp:latest .
+
+      - name: Push MCP image
+        run: |
+          docker push $ACR_NAME.azurecr.io/mmctagent-mcp:$IMAGE_TAG
+          docker push $ACR_NAME.azurecr.io/mmctagent-mcp:latest
+
+      - name: Parse env vars
+        id: env
+        env:
+          MCP_ENV_VARS_RAW: ${{ secrets.MCP_ENV_VARS_PROD }}
+        run: |
+          # Build --set-env-vars flag from MCP_ENV_VARS_PROD secret.
+          # Each KEY=VALUE pair is single-quoted to prevent shell expansion
+          # of special characters (e.g. $ in passwords).
+          ENV_FLAGS=""
+          if [ -n "$MCP_ENV_VARS_RAW" ]; then
+            while IFS= read -r line; do
+              line=$(echo "$line" | xargs)  # trim whitespace
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              ENV_FLAGS="$ENV_FLAGS '$line'"
+            done <<< "$MCP_ENV_VARS_RAW"
+          fi
+          echo "env_flags=$ENV_FLAGS" >> $GITHUB_OUTPUT
+
+      - name: Ensure networking infrastructure (VNet + NAT Gateway)
+        id: networking
+        run: |
+          echo "::group::VNet"
+          if az network vnet show --name $VNET_NAME --resource-group $RESOURCE_GROUP &>/dev/null; then
+            echo "VNet $VNET_NAME already exists."
+          else
+            echo "Creating VNet $VNET_NAME..."
+            az network vnet create \
+              --name $VNET_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --location $LOCATION \
+              --address-prefixes 10.0.0.0/16
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Subnet"
+          if az network vnet subnet show --name $SUBNET_NAME --vnet-name $VNET_NAME --resource-group $RESOURCE_GROUP &>/dev/null; then
+            echo "Subnet $SUBNET_NAME already exists."
+          else
+            echo "Creating subnet $SUBNET_NAME (10.0.0.0/23, delegated to Microsoft.App/environments)..."
+            az network vnet subnet create \
+              --name $SUBNET_NAME \
+              --vnet-name $VNET_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --address-prefixes 10.0.0.0/23 \
+              --delegations Microsoft.App/environments
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Public IP for NAT Gateway"
+          if az network public-ip show --name $NAT_GW_PIP_NAME --resource-group $RESOURCE_GROUP &>/dev/null; then
+            echo "Public IP $NAT_GW_PIP_NAME already exists."
+          else
+            echo "Creating static public IP $NAT_GW_PIP_NAME..."
+            az network public-ip create \
+              --name $NAT_GW_PIP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --location $LOCATION \
+              --sku Standard \
+              --allocation-method Static \
+              --zone 1 2 3
+          fi
+          echo "::endgroup::"
+
+          echo "::group::NAT Gateway"
+          if az network nat gateway show --name $NAT_GW_NAME --resource-group $RESOURCE_GROUP &>/dev/null; then
+            echo "NAT Gateway $NAT_GW_NAME already exists."
+          else
+            echo "Creating NAT Gateway $NAT_GW_NAME..."
+            az network nat gateway create \
+              --name $NAT_GW_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --location $LOCATION \
+              --public-ip-addresses $NAT_GW_PIP_NAME \
+              --idle-timeout 4
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Associate NAT Gateway with subnet"
+          CURRENT_NAT=$(az network vnet subnet show \
+            --name $SUBNET_NAME --vnet-name $VNET_NAME --resource-group $RESOURCE_GROUP \
+            --query "natGateway.id" -o tsv 2>/dev/null)
+          if [ -n "$CURRENT_NAT" ] && [ "$CURRENT_NAT" != "None" ]; then
+            echo "Subnet already has NAT Gateway associated."
+          else
+            echo "Associating NAT Gateway with subnet..."
+            az network vnet subnet update \
+              --name $SUBNET_NAME \
+              --vnet-name $VNET_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --nat-gateway $NAT_GW_NAME
+          fi
+          echo "::endgroup::"
+
+          # Export subnet resource ID and NAT public IP for downstream steps
+          SUBNET_ID=$(az network vnet subnet show \
+            --name $SUBNET_NAME --vnet-name $VNET_NAME --resource-group $RESOURCE_GROUP \
+            --query id -o tsv)
+          NAT_PUBLIC_IP=$(az network public-ip show \
+            --name $NAT_GW_PIP_NAME --resource-group $RESOURCE_GROUP \
+            --query ipAddress -o tsv)
+
+          echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "nat_public_ip=$NAT_PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "NAT Gateway public IP: $NAT_PUBLIC_IP"
+
+      - name: Recreate Container Apps Environment with VNet (one-time migration)
+        if: github.event.inputs.recreate_environment == 'true'
+        run: |
+          echo "⚠️  Recreating Container Apps Environment with VNet integration..."
+          echo "Deleting existing environment $CONTAINER_ENV_NAME..."
+          az containerapp env delete \
+            --name $CONTAINER_ENV_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --yes || echo "Environment did not exist or already deleted."
+          echo "Waiting for deletion to complete..."
+          sleep 30
+
+      - name: Ensure Container Apps Environment exists
+        run: |
+          if ! az containerapp env show --name $CONTAINER_ENV_NAME --resource-group $RESOURCE_GROUP &>/dev/null; then
+            echo "Creating Container Apps Environment: $CONTAINER_ENV_NAME with VNet integration..."
+            az containerapp env create \
+              --name $CONTAINER_ENV_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --location $LOCATION \
+              --infrastructure-subnet-resource-id ${{ steps.networking.outputs.subnet_id }}
+          else
+            echo "Environment $CONTAINER_ENV_NAME already exists."
+            # Verify VNet integration
+            VNET_ID=$(az containerapp env show --name $CONTAINER_ENV_NAME --resource-group $RESOURCE_GROUP \
+              --query "properties.vnetConfiguration.infrastructureSubnetId" -o tsv 2>/dev/null)
+            if [ -z "$VNET_ID" ] || [ "$VNET_ID" = "None" ]; then
+              echo "::warning::Environment exists but has NO VNet integration. Run this workflow with 'recreate_environment=true' to migrate."
+            else
+              echo "Environment has VNet integration: $VNET_ID"
+            fi
+          fi
+
+      - name: Resolve managed identity client ID
+        id: identity
+        run: |
+          CLIENT_ID=$(az identity show --ids $USER_ASSIGNED_IDENTITY --query clientId -o tsv)
+          echo "client_id=$CLIENT_ID" >> $GITHUB_OUTPUT
+          echo "Resolved managed identity client ID: $CLIENT_ID"
+
+      - name: Ensure Application Insights exists
+        id: appinsights
+        run: |
+          APPINSIGHTS_NAME="mmctagent-insights"
+          if az monitor app-insights component show --app $APPINSIGHTS_NAME --resource-group $RESOURCE_GROUP &>/dev/null; then
+            echo "Application Insights $APPINSIGHTS_NAME already exists."
+          else
+            echo "Creating Application Insights: $APPINSIGHTS_NAME..."
+            WORKSPACE_ID=$(az containerapp env show \
+              --name $CONTAINER_ENV_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --query "properties.appLogsConfiguration.logAnalyticsConfiguration.customerId" -o tsv)
+            WORKSPACE_RESOURCE_ID=$(az monitor log-analytics workspace list \
+              --resource-group $RESOURCE_GROUP \
+              --query "[?customerId=='$WORKSPACE_ID'].id" -o tsv)
+            az monitor app-insights component create \
+              --app $APPINSIGHTS_NAME \
+              --location $LOCATION \
+              --resource-group $RESOURCE_GROUP \
+              --kind web \
+              --application-type web \
+              --workspace "$WORKSPACE_RESOURCE_ID" \
+              -o none
+          fi
+          CONN_STR=$(az monitor app-insights component show \
+            --app $APPINSIGHTS_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query connectionString -o tsv)
+          echo "appinsights_conn_str=$CONN_STR" >> $GITHUB_OUTPUT
+          echo "Resolved App Insights connection string"
+
+      - name: Deploy to Container App
+        run: |
+          # Check if the Container App already exists
+          if az containerapp show --name $MCP_APP_NAME --resource-group $RESOURCE_GROUP &>/dev/null; then
+            echo "Updating existing Container App..."
+            # Fetch existing FQDN so BASE_URL can be set in the same revision
+            FQDN=$(az containerapp show \
+              --name $MCP_APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --query "properties.configuration.ingress.fqdn" \
+              --output tsv)
+            az containerapp identity assign \
+              --name $MCP_APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --user-assigned $USER_ASSIGNED_IDENTITY
+            az containerapp registry set \
+              --name $MCP_APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --server $ACR_NAME.azurecr.io \
+              --identity $USER_ASSIGNED_IDENTITY
+            az containerapp update \
+              --name $MCP_APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --image $ACR_NAME.azurecr.io/mmctagent-mcp:$IMAGE_TAG \
+              --set-env-vars \
+                AZURE_CLIENT_ID=${{ steps.identity.outputs.client_id }} \
+                APPLICATIONINSIGHTS_CONNECTION_STRING="${{ steps.appinsights.outputs.appinsights_conn_str }}" \
+                BUILD_SHA=${{ github.sha }} \
+                BUILD_RUN_ID=${{ github.run_id }} \
+                BUILD_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                BASE_URL="https://$FQDN" \
+                ${{ steps.env.outputs.env_flags }}
+          else
+            echo "Creating new Container App..."
+            az containerapp create \
+              --name $MCP_APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --environment $CONTAINER_ENV_NAME \
+              --image $ACR_NAME.azurecr.io/mmctagent-mcp:$IMAGE_TAG \
+              --registry-server $ACR_NAME.azurecr.io \
+              --registry-identity $USER_ASSIGNED_IDENTITY \
+              --user-assigned $USER_ASSIGNED_IDENTITY \
+              --target-port 8000 \
+              --ingress external \
+              --cpu 4.0 \
+              --memory 8Gi \
+              --min-replicas 2 \
+              --max-replicas 10 \
+              --env-vars \
+                AZURE_CLIENT_ID=${{ steps.identity.outputs.client_id }} \
+                APPLICATIONINSIGHTS_CONNECTION_STRING="${{ steps.appinsights.outputs.appinsights_conn_str }}" \
+                BUILD_SHA=${{ github.sha }} \
+                BUILD_RUN_ID=${{ github.run_id }} \
+                BUILD_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                ${{ steps.env.outputs.env_flags }}
+            # Set BASE_URL after creation (FQDN only available post-create)
+            FQDN=$(az containerapp show \
+              --name $MCP_APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --query "properties.configuration.ingress.fqdn" \
+              --output tsv)
+            az containerapp update \
+              --name $MCP_APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --set-env-vars "BASE_URL=https://$FQDN"
+          fi
+
+      - name: Configure health probes
+        run: |
+          # Probes persist across image/env-var updates, so only set once.
+          PROBE_COUNT=$(az containerapp show \
+            --name $MCP_APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "length(properties.template.containers[0].probes || \`[]\`)" \
+            -o tsv 2>/dev/null || echo "0")
+
+          if [ "$PROBE_COUNT" -gt "0" ]; then
+            echo "Health probes already configured ($PROBE_COUNT probes), skipping."
+            exit 0
+          fi
+
+          echo "Configuring startup, liveness, and readiness probes..."
+
+          # Fetch current container config, inject probes, wrap as update payload
+          az containerapp show \
+            --name $MCP_APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            -o json \
+          | jq '{
+              properties: {
+                template: {
+                  containers: [
+                    .properties.template.containers[0] | .probes = [
+                      {
+                        "type": "Startup",
+                        "httpGet": {"path": "/", "port": 8000},
+                        "initialDelaySeconds": 15,
+                        "periodSeconds": 5,
+                        "failureThreshold": 10,
+                        "timeoutSeconds": 3
+                      },
+                      {
+                        "type": "Liveness",
+                        "httpGet": {"path": "/", "port": 8000},
+                        "periodSeconds": 15,
+                        "failureThreshold": 3,
+                        "timeoutSeconds": 3
+                      },
+                      {
+                        "type": "Readiness",
+                        "httpGet": {"path": "/readyz", "port": 8000},
+                        "initialDelaySeconds": 20,
+                        "periodSeconds": 30,
+                        "failureThreshold": 3,
+                        "timeoutSeconds": 10
+                      }
+                    ]
+                  ]
+                }
+              }
+            }' > /tmp/app-probes.json
+
+          az containerapp update \
+            --name $MCP_APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --yaml /tmp/app-probes.json
+
+          echo "Health probes configured successfully."
+
+      - name: Print deployment info
+        run: |
+          FQDN=$(az containerapp show \
+            --name $MCP_APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+          echo "## MCP Server Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Health** | https://$FQDN/ |" >> $GITHUB_STEP_SUMMARY
+          echo "| **MCP Endpoint** | https://$FQDN/mcp |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag** | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **NAT Gateway IP** | \`${{ steps.networking.outputs.nat_public_ip }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Verify external service connectivity
+        continue-on-error: true
+        run: |
+          FQDN=$(az containerapp show \
+            --name $MCP_APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          OUTBOUND_IP="${{ steps.networking.outputs.nat_public_ip }}"
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Readiness Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Wait for health endpoint to return 200 (service may take up to 60s to start)
+          echo "Waiting for health endpoint..."
+          for i in $(seq 1 12); do
+            HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$FQDN/" 2>/dev/null) || true
+            if [ "$HEALTH_CODE" = "200" ]; then
+              echo "Health check passed on attempt $i"
+              break
+            fi
+            echo "Health attempt $i/12: HTTP $HEALTH_CODE, retrying in 5s..."
+            sleep 5
+          done
+
+          # Now call readyz for external service connectivity
+          READYZ=""
+          for attempt in 1 2 3; do
+            HTTP_CODE=$(curl -s -o /tmp/readyz_response.json -w "%{http_code}" --max-time 30 "https://$FQDN/readyz" 2>/dev/null) || true
+            if [ -f /tmp/readyz_response.json ] && [ "$HTTP_CODE" -gt 0 ] 2>/dev/null; then
+              READYZ=$(cat /tmp/readyz_response.json)
+              break
+            fi
+            echo "Readyz attempt $attempt: container not reachable (HTTP $HTTP_CODE), retrying in 10s..."
+            rm -f /tmp/readyz_response.json
+            sleep 10
+          done
+
+          if [ -z "$READYZ" ]; then
+            READYZ="{\"ready\":false,\"error\":\"MCP server at https://$FQDN/readyz is unreachable after 3 attempts. The container may still be starting or the ingress is misconfigured.\"}"
+          fi
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          echo "$READYZ" | python3 -m json.tool >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "$READYZ" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**NAT Gateway Outbound IP:** \`$OUTBOUND_IP\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Graph DB allowlisting:** If the readiness check below shows a" >> $GITHUB_STEP_SUMMARY
+          echo "> graph\_db connection error, add \`$OUTBOUND_IP\` to the inbound" >> $GITHUB_STEP_SUMMARY
+          echo "> allow-list (NSG rule / firewall) on the graph database for the" >> $GITHUB_STEP_SUMMARY
+          echo "> Bolt port (default 7687)." >> $GITHUB_STEP_SUMMARY

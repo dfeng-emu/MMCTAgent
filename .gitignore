@@ -211,3 +211,6 @@ cython_debug/
 
 # Personal scratch docs (planning notes, ad-hoc test scripts, MSAL caches)
 .mydocs/
+
+*.env*
+graphify-out
