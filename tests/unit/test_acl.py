@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 import httpx
 import pytest
 import respx
+from loguru import logger
 
 from mmct.acl import (
-    AccessCheckResult,
     GraphAPIError,
     GraphAuthenticationError,
     GraphRateLimitError,
@@ -23,10 +22,6 @@ DRIVE_ID = "drive123"
 ITEM_ID = "item456"
 VIDEO_ID = "vid_abc"
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _item_url(drive_id: str = DRIVE_ID, item_id: str = ITEM_ID) -> str:
     return f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}"
@@ -36,11 +31,6 @@ def _make_vid(
     video_id: str = VIDEO_ID, drive_id: str = DRIVE_ID, item_id: str = ITEM_ID
 ) -> VideoIdentifier:
     return VideoIdentifier(video_id=video_id, drive_id=drive_id, item_id=item_id)
-
-
-# ---------------------------------------------------------------------------
-# check_access_to_video tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -121,24 +111,34 @@ async def test_payload_mismatch_on_200():
 @pytest.mark.asyncio
 @pytest.mark.unit
 @respx.mock
-async def test_token_not_logged(caplog):
-    respx.get(_item_url()).mock(return_value=httpx.Response(200, json={"id": ITEM_ID}))
-    with caplog.at_level(logging.DEBUG):
+async def test_token_not_logged():
+    # Loguru doesn't propagate to stdlib logging; attach a direct sink so we
+    # actually see what would have been emitted.
+    captured: list[str] = []
+    sink_id = logger.add(lambda msg: captured.append(str(msg)), level="DEBUG")
+    try:
+        respx.get(_item_url()).mock(return_value=httpx.Response(200, json={"id": ITEM_ID}))
         async with httpx.AsyncClient() as client:
             await check_access_to_video(client, TOKEN, DRIVE_ID, ITEM_ID)
-    for record in caplog.records:
-        assert TOKEN not in record.getMessage()
+    finally:
+        logger.remove(sink_id)
+
+    assert captured, "expected at least one log message"
+    for msg in captured:
+        assert TOKEN not in msg
 
 
-# ---------------------------------------------------------------------------
-# check_access_to_video_list tests
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_empty_token_raises_auth_error():
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(GraphAuthenticationError):
+            await check_access_to_video(client, "", DRIVE_ID, ITEM_ID)
 
 
 @pytest.mark.asyncio
 @pytest.mark.unit
 async def test_empty_list_returns_empty_result():
-    # No HTTP calls should be made; no respx mock needed
     result = await check_access_to_video_list(TOKEN, [])
     assert result.access_allowed == []
     assert result.access_denied == []
@@ -214,7 +214,6 @@ async def test_concurrency_limit_respected():
         peak_concurrent = max(peak_concurrent, concurrent_count)
         await asyncio.sleep(0.01)
         concurrent_count -= 1
-        # Extract item_id from URL to return matching payload
         item_id = request.url.path.split("/")[-1]
         return httpx.Response(200, json={"id": item_id})
 

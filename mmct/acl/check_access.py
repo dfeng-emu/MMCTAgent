@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import httpx
 from loguru import logger
 
+from mmct.utils.error_handler import ProviderException
+
+_log = logger.bind(component="acl")
+
 GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class GraphACLError(Exception):
+class GraphACLError(ProviderException):
     """Base class for MS Graph ACL errors."""
 
 
@@ -23,20 +23,15 @@ class GraphAuthenticationError(GraphACLError):
 
 
 class GraphRateLimitError(GraphACLError):
-    """HTTP 429 — MS Graph rate limit hit. Caller should back off."""
+    """HTTP 429 — MS Graph rate limit hit. Fails the whole batch."""
 
 
 class GraphAPIError(GraphACLError):
-    """HTTP 5xx or unexpected status — logged and treated as check_failed."""
+    """HTTP 5xx or unexpected status — treated as check_failed in batches."""
 
     def __init__(self, status_code: int, detail: str) -> None:
         super().__init__(f"Graph API error {status_code}: {detail}")
         self.status_code = status_code
-
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -53,17 +48,10 @@ class AccessCheckResult:
     check_failed: list[str] = field(default_factory=list)
 
 
-# Internal result container that retains video_id across gather() boundaries.
 @dataclass
 class _SingleResult:
     video_id: str
-    granted: bool | None  # None means an error occurred
-    error: Exception | None = None
-
-
-# ---------------------------------------------------------------------------
-# Core functions
-# ---------------------------------------------------------------------------
+    granted: bool | None
 
 
 async def check_access_to_video(
@@ -72,38 +60,50 @@ async def check_access_to_video(
     drive_id: str,
     item_id: str,
 ) -> bool:
-    """Return True if the token bearer has read access to the given OneDrive item."""
-    url = f"{GRAPH_API_BASE}/drives/{drive_id}/items/{item_id}"
+    """Return True if the token bearer has read access to the given OneDrive item.
+
+    Raises GraphAuthenticationError on 401, GraphRateLimitError on 429,
+    and GraphAPIError on other unexpected statuses or malformed 200 payloads.
+    Callers configure timeouts on the passed httpx client.
+    """
+    if not graph_token:
+        raise GraphAuthenticationError("graph_token is empty or None")
+
+    url = (
+        f"{GRAPH_API_BASE}/drives/{quote(drive_id, safe='')}"
+        f"/items/{quote(item_id, safe='')}"
+    )
     headers = {"Authorization": f"Bearer {graph_token}"}
 
-    logger.debug("Checking Graph access drive_id={} item_id={}", drive_id, item_id)
+    _log.debug("Checking Graph access drive_id={} item_id={}", drive_id, item_id)
 
     response = await client.get(url, headers=headers)
     status = response.status_code
 
     if status == 200:
         body = response.json()
-        if body.get("id") != item_id:
-            raise GraphAPIError(200, f"item_id mismatch: expected {item_id}, got {body.get('id')}")
-        logger.debug("Access granted drive_id={} item_id={}", drive_id, item_id)
+        if not isinstance(body, dict) or body.get("id") != item_id:
+            raise GraphAPIError(200, f"item_id mismatch: expected {item_id}")
+        _log.debug("Access granted drive_id={} item_id={}", drive_id, item_id)
         return True
 
     if status in (403, 404):
-        logger.debug("Access denied ({}) drive_id={} item_id={}", status, drive_id, item_id)
+        _log.debug("Access denied ({}) drive_id={} item_id={}", status, drive_id, item_id)
         return False
 
     if status == 401:
-        logger.warning("Graph authentication failure drive_id={} item_id={}", drive_id, item_id)
+        _log.warning("Graph authentication failure drive_id={} item_id={}", drive_id, item_id)
         raise GraphAuthenticationError("MS Graph returned 401 — token invalid or expired")
 
     if status == 429:
-        logger.warning("Graph rate limit hit drive_id={} item_id={}", drive_id, item_id)
+        _log.warning("Graph rate limit hit drive_id={} item_id={}", drive_id, item_id)
         raise GraphRateLimitError("MS Graph returned 429 — rate limited")
 
-    logger.warning(
+    # Never log or include response.text — upstream proxies could echo Bearer tokens.
+    _log.warning(
         "Unexpected Graph status {} drive_id={} item_id={}", status, drive_id, item_id
     )
-    raise GraphAPIError(status, response.text[:200])
+    raise GraphAPIError(status, f"unexpected status {status}")
 
 
 async def check_access_to_video_list(
@@ -112,7 +112,13 @@ async def check_access_to_video_list(
     *,
     max_concurrency: int = 10,
 ) -> AccessCheckResult:
-    """Check MS Graph access for a batch of videos, returning a three-bucket result."""
+    """Check MS Graph access for a batch of videos, returning a three-bucket result.
+
+    GraphAuthenticationError and GraphRateLimitError on any item abort the whole
+    batch (propagated to the caller). Other errors (5xx, network, malformed
+    payload) bucket the affected video into `check_failed` so the caller can
+    fail closed without losing observability.
+    """
     if not video_identifiers:
         return AccessCheckResult()
 
@@ -126,15 +132,15 @@ async def check_access_to_video_list(
                 )
                 return _SingleResult(video_id=vid.video_id, granted=granted)
             except (GraphAuthenticationError, GraphRateLimitError):
-                raise  # propagate — fail the whole batch
-            except Exception as exc:
-                logger.warning(
+                raise
+            except (GraphAPIError, httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                _log.warning(
                     "Graph API error for drive_id={} item_id={}: {}",
                     vid.drive_id,
                     vid.item_id,
                     exc,
                 )
-                return _SingleResult(video_id=vid.video_id, granted=None, error=exc)
+                return _SingleResult(video_id=vid.video_id, granted=None)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         tasks = [_check_one(client, vid) for vid in video_identifiers]
@@ -142,12 +148,8 @@ async def check_access_to_video_list(
 
     result = AccessCheckResult()
     for raw in raw_results:
-        # GraphAuthenticationError / GraphRateLimitError bubble up through gather as exceptions
-        if isinstance(raw, (GraphAuthenticationError, GraphRateLimitError)):
-            raise raw
         if isinstance(raw, Exception):
-            raise raw  # unexpected — propagate
-        assert isinstance(raw, _SingleResult)
+            raise raw
         if raw.granted is True:
             result.access_allowed.append(raw.video_id)
         elif raw.granted is False:
